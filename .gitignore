@@ -1,0 +1,57 @@
+node_modules/
+*.log
+*.tgz
+.playwright-mcp/
+.test-cache/
+scene-diagnosis.tsv
+# Local ffmpeg (Windows static build, ~370MB) — used for transcode experiments;
+# never commit binaries (platform-specific + huge).
+/ffmpeg/
+# 渲染验证产物 (可再生): 帧序列/对比图不入库
+scene-layers-out/
+# 视觉工具工件
+.dsh-vision-router/
+
+
+
+
+/_refs/
+
+# README 展示图: 默认忽略工作截图, 仅放行当前 README 引用的 5 张 (勿删白名单)
+/docs/images/*
+!/docs/images/main-interface.gif
+!/docs/images/settings-ui.gif
+!/docs/images/wallpaper-library.gif
+!/docs/images/mascot-drawer.png
+!/docs/images/better-sidebar-font.png
+
+/.git.bak-broken/
+
+
+
+/scripts/lwe-ref/
+
+
+# 渲染输出 (回归/调试用, 不入库)
+/scripts/out/
+
+# 逆向相关工具与诊断脚本 (本地研究用, 不入 GitHub 仓库)
+/scripts/reverse/
+/scripts/core/
+/scripts/anim/
+
+# ZCode 会话本地文件 (计划/缓存, 不入库)
+/.zcode/
+# ZCode video2code / video-agent 插件在仓库根写的 plugin_root 指针 (内容是本机绝对路径, 不入库)
+/.v2c/
+/.video_agent/
+
+# 临时预览/诊断脚本 (本地 QA 用, 不入库)
+/scripts/.tmp-*
+
+# 本地移交/取证笔记 (集成期间的报告、守卫实测、scratch 脚本; 属本机过程记录, 不入库)
+# 此前只写在 .git/info/exclude 里 —— 那是**每个 clone 各写一份**的本地配置,
+# 于是每个新工作区都会把 400+ 个笔记文件当未跟踪改动报出来。
+/.integration-notes/
+.DS_Store
+**/.DS_Store
