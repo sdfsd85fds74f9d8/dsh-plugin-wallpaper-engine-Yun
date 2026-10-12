@@ -1,0 +1,894 @@
+// Verify protected host floors and the explicitly transparent chat surfaces.
+//
+// Why this suite exists: the wallpaper may be dimmed/blended so it "does not
+// dominate", but TEXT MUST STAY READABLE. IDEA's background-image feature has a
+// single knob (image opacity) and still "just works" because the image always
+// sits BEHIND the editor / tool-window surfaces, which keep a background of
+// their own. This plugin lacked that structural property: every text-bearing
+// surface was painted as `glass colour @ --we-glass-alpha`, and in dark mode
+// that alpha is additionally multiplied by 0.4 — worst case 0.03 × 0.4 = 0.012,
+// i.e. no frost at all. The floor is a THEME-BASE LAYER composited OVER the
+// glass tint at a fixed weight:
+//
+//     color-mix(in srgb, <theme base> floor%, <glass tint @ its alpha> (1-floor)%)
+//     effective alpha = floor + a·(1−floor) ≥ floor
+//
+// so neither 玻璃透明度 nor the dark-theme ×0.4/×0.33 factors can undercut it
+// (they only scale the tint operand). Clamping the tint alpha itself with max()
+// cannot work — in dark mode the tint is a WHITE glaze and can only LIGHTEN the
+// surface (measured ceiling 1.79:1 at any alpha), so the theme-base layer is
+// the only shape that reaches the WCAG 4.5:1 body-text target. Where a surface
+// drives its own same-colour alpha (the editor/terminal content plate) the
+// floor IS a literal max() clamp, which leaves the user's value above the floor
+// byte-identical.
+//
+// Chat element overrides intentionally bypass shared-token floors at the user
+// glass-alpha setting. F2c–F2g check those overrides and their single plate;
+// the remaining floor checks still protect settings, popups, sidebars/editors.
+// Assertions (all derived from the BUILT lib/client.js — nothing re-typed):
+//   F1  the floor is an explicit named constant + CSS token pair, and the
+//       stylesheet copy matches the JS constant (no drift).
+//   F2  every text-bearing surface the plugin drives carries the floor in BOTH
+//       themes: composer/bubble tokens, settings-window layers 1/2/3, sidebar
+//       panels + native right panel, the plugin's own drawer, and
+//       the update toast (max() form).
+//   F3  the content-surface plate uses a literal max() clamp on its own alpha.
+//   F4  the software-render fallback plate still clears the floor (the #95
+//       fallback from 8894670/7ba5643 keeps working).
+//   F5  DSH Desktop 的外壳画布底必须被清掉，且插件侧**不得**钉模式名
+//       （模式名漂移免疫：漏清与"写回单一模式门控"两个方向都要红）
+//   C1  full grid 玻璃透明度 {0,15,30,45,60} × theme {light,dark} × 壁纸透明度
+//       {0,50,90}: the effective composer-surface alpha is ≥ the floor, with the
+//       computed numbers printed.
+//   C2  the floor is NOT reduced at 玻璃透明度 = 60 (its most transparent end).
+//   C3  the floor is NOT affected by 壁纸透明度: the floor declarations never
+//       read --we-wallpaper-opacity, the effective alpha is identical for
+//       {0,50,90}, and that token still only drives .we-layer.
+//   C4  above the floor the slider is NOT flattened: the alpha still changes
+//       monotonically with 玻璃透明度, and for the content plate every user
+//       alpha above the floor passes through unchanged.
+//   C5  the dark-theme ×0.4 tint factor cannot undercut the floor (the veil
+//       weight is independent of it) — proven against the extracted factor.
+//   M1  the measurement has discriminating power: the UN-floored tint fails
+//       4.5:1 in the worst case (the bug), the floored surface passes.
+//   M2  helpers behave (positive + negative controls on the contrast maths).
+//   C6  stylesheet integrity + the wallpaper layer can never cover the UI.
+//   C0f the glass-fidelity tier (weClampSurfaceColor 3rd param): default is
+//       byte-identical to the legacy 2-arg call, 0 passes the raw color
+//       through, and the lerp toward the raw color is monotone + sandwiched —
+//       the stylesheet composes the floor with --we-glass-fidelity (default 1).
+//   F7  侧栏全透明（issue #137，sidebarFullClear）：放弃地板的**显式开关**链路
+//       完整且默认关 —— 默认值 false + boolFalse kind、门控属性成对挂/摘、UI 行
+//       过 weT、规则组逐条带壁纸门（无壁纸不生效）且把地板/色染/釉光归零。
+//       这是地板的**反向判据**：它证明"绕过地板"只能经这一个显式开关发生。
+//
+// Usage: node test/verify-readability.mjs
+import { readFileSync } from 'node:fs';
+
+const results = [];
+function check(name, ok, detail) {
+  results.push({ name, ok: !!ok });
+  console.log((ok ? 'PASS' : 'FAIL') + ' | ' + name + (detail ? ' | ' + detail : ''));
+}
+
+const SRC = readFileSync(new URL('../lib/client.js', import.meta.url), 'utf8');
+
+// ── source → values ─────────────────────────────────────────────────────────
+function num(re, text = SRC) {
+  const m = text.match(re);
+  return m ? Number(m[1]) : NaN;
+}
+
+// 1) the named JS constants (single source of truth for both floor values)
+const FLOOR_JS = {
+  light: num(/const READABILITY_FLOOR = ([\d.]+);/),
+  dark: num(/const READABILITY_FLOOR_DARK = ([\d.]+);/),
+};
+
+// 2) the injected stylesheet: evaluate the CSS template literal with exactly
+// those constants (so the string checked here IS the string the plugin injects).
+// ⚠️ 锚点锚在行首且容忍缩进（产物把内联模块整段缩进过）：散文里出现同样的声明字面量会把锚点带偏。
+const CSS_BODY_MATCH = SRC.match(/^\s*const CSS = `([^`]*)`;/m);
+const CSS_BODY = CSS_BODY_MATCH ? CSS_BODY_MATCH[1] : '';
+let CSS = '';
+let cssError = null;
+try {
+  CSS = new Function('READABILITY_FLOOR', 'READABILITY_FLOOR_DARK',
+    'return `' + CSS_BODY + '`;')(FLOOR_JS.light, FLOOR_JS.dark);
+} catch (err) { cssError = err && err.message; }
+
+// 3) the glass-alpha mapping, derived from the source (never re-typed here)
+const GMAP = SRC.match(/const glassAlpha = Math\.max\(([\d.]+), ([\d.]+) - \(selection\.glassAlpha \/ ([\d.]+)\) \* ([\d.]+)\);/);
+const glassAlpha = GMAP
+  ? (pct) => Math.max(Number(GMAP[1]), Number(GMAP[2]) - (pct / Number(GMAP[3])) * Number(GMAP[4]))
+  : null;
+
+// ── flat-rule lookup on the injected stylesheet ─────────────────────────────
+/** Every flat rule whose body declares `prop` (brace-depth matched). */
+function rulesWithProp(prop) {
+  const out = [];
+  const needle = prop + ':';
+  let from = 0;
+  for (;;) {
+    const at = CSS.indexOf(needle, from);
+    if (at < 0) break;
+    from = at + needle.length;
+    const open = CSS.lastIndexOf('{', at);
+    if (open < 0) continue;
+    const prevClose = CSS.lastIndexOf('}', open);
+    const header = CSS.slice(prevClose + 1, open).trim();
+    let depth = 0, close = -1;
+    for (let i = open; i < CSS.length; i++) {
+      if (CSS[i] === '{') depth++;
+      else if (CSS[i] === '}') { depth--; if (depth === 0) { close = i; break; } }
+    }
+    if (close < 0) continue;
+    out.push({ header, body: CSS.slice(open + 1, close) });
+  }
+  return out;
+}
+
+function declValue(body, prop) {
+  const m = body.match(new RegExp('(?:^|[\\s;])' + prop + ':\\s*([^;]+);'));
+  return m ? m[1].trim() : null;
+}
+
+/** The rule declaring `prop` whose header contains `selector`, if any. */
+function ruleFor(prop, selector) {
+  return rulesWithProp(prop).find((r) => r.header.includes(selector)) || null;
+}
+
+/** Does this declaration open with the floor veil (theme base at floor weight)? */
+function hasVeil(value, label) {
+  if (value === null) return { ok: false, why: label + ': declaration missing' };
+  // 对话栏解耦后，气泡 / 输入卡片 / 对话内 markdown 家族消费 --we-chat-readability-*
+  //（独立保真度旋钮 chatGlassFidelity），其余面仍消费全局对 —— 两种形态都算「带下限」。
+  const ok = /^color-mix\(in srgb,\s*var\(--we-(?:chat-)?readability-base\)\s+calc\(var\(--we-(?:chat-)?readability-floor\) \* 100%\),/.test(value)
+    && /calc\(\(1 - var\(--we-(?:chat-)?readability-floor\)\) \* 100%\)/.test(value);
+  return { ok, why: label + ': ' + JSON.stringify(value.slice(0, 120)) };
+}
+
+// ── colour maths (WCAG 2.x) ─────────────────────────────────────────────────
+const hex2rgb = (hex) => [1, 3, 5].map((i) => parseInt(hex.slice(i, i + 2), 16));
+const s2l = (c) => { c /= 255; return c <= 0.03928 ? c / 12.92 : Math.pow((c + 0.055) / 1.055, 2.4); };
+const lum = ([r, g, b]) => 0.2126 * s2l(r) + 0.7152 * s2l(g) + 0.0722 * s2l(b);
+const contrast = (a, b) => {
+  const la = lum(a), lb = lum(b), hi = Math.max(la, lb), lo = Math.min(la, lb);
+  return (hi + 0.05) / (lo + 0.05);
+};
+const over = (fg, fa, bg) => fg.map((c, i) => c * fa + bg[i] * (1 - fa));
+/** theme-base veil at `F` composited OVER a tint of colour `frost` at alpha `w`. */
+const veil = (frost, w, base, F) => {
+  const alpha = F + w * (1 - F);
+  const premult = frost.map((c, i) => base[i] * F + c * w * (1 - F));
+  return { alpha, color: premult.map((c) => c / alpha) };
+};
+
+const GRID_GLASS = [0, 15, 30, 45, 60];
+const GRID_WP = [0, 50, 90];
+const TEXT = { light: [0, 0, 0], dark: [255, 255, 255] };
+// worst-case backdrop: the darkest / brightest plausible wallpaper pixel (the
+// wallpaper is fully opaque there, i.e. 壁纸透明度 = 0).
+const WORST_PIXEL = { light: [0, 0, 0], dark: [255, 255, 255] };
+// page base the wallpaper blends toward (README: light → white, dark → black)
+const PAGE_BASE = { light: [255, 255, 255], dark: [0, 0, 0] };
+
+function main() {
+  // ── F1: explicit named floor, JS constant ↔ CSS token, no drift ───────────
+  check('F1a the floor is an explicit named pair of JS constants',
+    FLOOR_JS.light > 0 && FLOOR_JS.light < 1 && FLOOR_JS.dark > 0 && FLOOR_JS.dark < 1,
+    'READABILITY_FLOOR=' + FLOOR_JS.light + ' READABILITY_FLOOR_DARK=' + FLOOR_JS.dark);
+
+  check('F1b the injected stylesheet was extracted + evaluated (no interpolation surprise)',
+    CSS.length > 50000 && cssError === null,
+    'css chars=' + CSS.length + ' · template error=' + JSON.stringify(cssError));
+
+  // 玻璃保真度（glassFidelity）落地后 floor 是组合声明：常量进 --we-readability-floor-base，
+  // --we-readability-floor = base × var(--we-glass-fidelity, 1)。缺省回退 1 ⇒ 默认行为
+  // 与旧逐位声明完全一致；F1d 仍然锚定**常量**本体（无漂移判据不变）。
+  const FLOOR_COMPOSED = '--we-readability-floor: calc(var(--we-readability-floor-base) * var(--we-glass-fidelity, 1));';
+  const lightVars = CSS.match(/body \{\s*--we-readability-floor-base:\s*([\d.]+);\s*--we-readability-floor:\s*calc\(var\(--we-readability-floor-base\) \* var\(--we-glass-fidelity, 1\)\);\s*--we-readability-base:\s*var\(--we-surface-tint-light, (#[0-9a-fA-F]{6})\);/);
+  const darkVars = CSS.match(/body\[data-ds-dark-theme\] \{\s*--we-readability-floor-base:\s*([\d.]+);\s*--we-readability-floor:\s*calc\(var\(--we-readability-floor-base\) \* var\(--we-glass-fidelity, 1\)\);\s*--we-readability-base:\s*var\(--we-surface-tint-dark, (#[0-9a-fA-F]{6})\);/);
+  check('F1c --we-readability-floor(-base) / --we-readability-base are declared for both themes (base = 染色地板 tint)',
+    lightVars !== null && darkVars !== null,
+    'light=' + JSON.stringify(lightVars && [Number(lightVars[1]), lightVars[2]])
+      + ' dark=' + JSON.stringify(darkVars && [Number(darkVars[1]), darkVars[2]]));
+  check('F1d the stylesheet floor EQUALS the JS constant (no drift)',
+    lightVars !== null && darkVars !== null
+      && Number(lightVars[1]) === FLOOR_JS.light && Number(darkVars[1]) === FLOOR_JS.dark,
+    'css=' + JSON.stringify(lightVars && Number(lightVars[1])) + '/' + JSON.stringify(darkVars && Number(darkVars[1]))
+      + ' js=' + FLOOR_JS.light + '/' + FLOOR_JS.dark);
+  check('F1e both theme blocks compose the floor with --we-glass-fidelity (default 1 = 逐位现状)',
+    CSS.split(FLOOR_COMPOSED).length === 3,
+    'composed declarations=' + (CSS.split(FLOOR_COMPOSED).length - 1) + ' (expect 2: light + dark)');
+  // F1f: 对话栏专属对（chatGlassFidelity 解耦）——组合形态与全局逐字同构，只换变量名。
+  const CHAT_COMPOSED = '--we-chat-readability-floor: calc(var(--we-readability-floor-base) * var(--we-chat-glass-fidelity, 1));';
+  check('F1f both theme blocks declare the chat-scoped floor/base pair (composed with --we-chat-glass-fidelity, default 1)',
+    CSS.split(CHAT_COMPOSED).length === 3
+      && (CSS.match(/--we-chat-readability-base: var\(--we-chat-surface-tint-light, #ffffff\);/g) || []).length === 1
+      && (CSS.match(/--we-chat-readability-base: var\(--we-chat-surface-tint-dark, #0d1524\);/g) || []).length === 1,
+    'chat floor declarations=' + (CSS.split(CHAT_COMPOSED).length - 1) + ' (expect 2)');
+  // F2c: 对话栏对的作用域钉子 —— 只准被气泡 / 输入卡片的 4 条声明消费（浅深 × 2 token）。
+  // 正文里的 markdown 内容面（代码块 / 行内代码 / 引用等）跟**全局**对（用户口径：
+  // 代码块不和输入框一起，与侧边栏同尺）—— chat 变量每多一处消费都会在这里现形。
+  const chatBaseUses = (CSS.match(/var\(--we-chat-readability-base\)/g) || []).length;
+  const markdownGlobal = ['markdown-code-block', 'markdown-inline-code', 'markdown-citation'].every((t) => {
+    const rule = ruleFor('--dsw-alias-' + t, 'body[data-we-glass-page]');
+    const v = rule ? declValue(rule.body, '--dsw-alias-' + t) : '';
+    return /var\(--we-readability-base\)/.test(v) && !/var\(--we-chat-/.test(v);
+  });
+  check('F2c the chat-scoped pair is consumed ONLY by bubble/input tokens (light+dark = 4 uses); the markdown content family stays on the global pair',
+    chatBaseUses === 4 && markdownGlobal,
+    'chat base uses=' + chatBaseUses + ' (expect 4) · markdown family on global pair=' + markdownGlobal);
+
+  // ── C0: the tint clamp (染色地板) ships as a pure function and holds its grid ──
+  // 钳制实现必须随 bundle 交付且可独立复算 —— 抽出来对三个极端输入各跑一遍。
+  // 内联产物用 tab 缩进 ⇒ 不能用 `\n}` 找函数尾，用**花括号计数**切出整个函数。
+  const clampStart = SRC.indexOf('function weClampSurfaceColor(');
+  let clampSrc = null;
+  if (clampStart >= 0) {
+    let depth = 0;
+    for (let i = clampStart; i < SRC.length; i++) {
+      const ch = SRC[i];
+      if (ch === '{') depth++;
+      else if (ch === '}') { depth--; if (depth === 0) { clampSrc = SRC.slice(clampStart, i + 1); break; } }
+    }
+  }
+  const weClampSurfaceColor = clampSrc
+    ? new Function('return (' + clampSrc + ')')()
+    : null;
+  const CLAMP_COLORS = ['#000000', '#7f7f7f', '#ffffff'];
+  const tintOf = {};
+  let clampUsable = weClampSurfaceColor !== null;
+  if (weClampSurfaceColor) {
+    try {
+      for (const theme of ['light', 'dark']) {
+        for (const gc of CLAMP_COLORS) {
+          const out = weClampSurfaceColor(gc, theme);
+          if (!/^#[0-9a-fA-F]{6}$/.test(out)) { clampUsable = false; break; }
+          tintOf[theme + ' ' + gc] = hex2rgb(out);
+        }
+      }
+    } catch { clampUsable = false; }
+  }
+  check('C0 the surface-tint clamp function ships in the bundle and clamps #000/#7f7f7f/#ffffff per theme',
+    clampUsable,
+    'extracted=' + (clampSrc !== null) + ' · tints=' + JSON.stringify(tintOf));
+
+  // ── C0f: 玻璃保真度分档（weClampSurfaceColor 第三参 fidelity，0–1）────────────
+  // 语义 = 两段式：先用满档地板跑完整红线的钳制（现状），再把结果向用户原色线性
+  // 回退。判据四条：缺省/1 = 与旧口径逐位一致（C 网格与现有玻璃判据因此不受扰动）；
+  // 0 = 原色直出；到原色的通道距离随 f **单调**下降（线性回退 ⇒ 无「中间档反而更
+  // 极端」的悬崖）；f=0.5 每通道**夹逼**在原色与完整钳制色之间（不塌端点纯色）。
+  let fidelityUsable = weClampSurfaceColor !== null;
+  let fidelityDetail = '';
+  if (weClampSurfaceColor) {
+    try {
+      const probe = '#00ccff';
+      const raw = hex2rgb(probe);
+      const dist = (hexOut) => hex2rgb(hexOut).reduce((s, v, i) => s + Math.abs(v - raw[i]), 0);
+      const defaultIsFull = ['light', 'dark'].every((t) => weClampSurfaceColor(probe, t) === weClampSurfaceColor(probe, t, 1));
+      const zeroPassesThrough = ['light', 'dark'].every((t) => weClampSurfaceColor(probe, t, 0) === probe);
+      const dists = [0, 0.25, 0.5, 0.75, 1].map((f) => dist(weClampSurfaceColor(probe, 'dark', f)));
+      const monotone = dists.every((d, i) => i === 0 || d >= dists[i - 1]);
+      const fullL = hex2rgb(weClampSurfaceColor(probe, 'light', 1));
+      const midL = hex2rgb(weClampSurfaceColor(probe, 'light', 0.5));
+      const sandwiched = midL.every((v, i) => v >= Math.min(fullL[i], raw[i]) && v <= Math.max(fullL[i], raw[i]));
+      fidelityUsable = defaultIsFull && zeroPassesThrough && monotone && sandwiched;
+      fidelityDetail = 'default==f1:' + defaultIsFull + ' · f0原色直出:' + zeroPassesThrough
+        + ' · 单调回退:' + monotone + ' (dark dists=' + dists.join('/') + ')'
+        + ' · f0.5夹逼:' + sandwiched;
+    } catch (e) { fidelityUsable = false; fidelityDetail = String(e && e.message); }
+  }
+  check('C0f the fidelity tier: default byte-identical, 0 passes the raw color, the lerp toward raw is monotone and sandwiched',
+    fidelityUsable, fidelityDetail);
+
+  // ── C0b: accent 墨色（issue #127）——纯函数随 bundle 交付，且逐色过对比度闸 ─────
+  // 宿主 primary 控件的契约是「填充 × label-primary-foreground 反色墨」成对翻转；
+  // 填充被重映射成任意亮度的用户配色后，墨必须按 accent 亮度重选（否则浅色配色 ×
+  // 浅色主题墨 ≈ 1.5:1 = 报告里的「文字与背景同色」）。判据：抽函数 + 三个已知色 +
+  // 对比度下限（黄底深墨 ≥ 7:1 / 蓝底白字 ≥ 3:1）。
+  const inkStart = SRC.indexOf('function weAccentInk(');
+  let inkSrc = null;
+  if (inkStart >= 0) {
+    let depth = 0;
+    for (let i = inkStart; i < SRC.length; i++) {
+      const ch = SRC[i];
+      if (ch === '{') depth++;
+      else if (ch === '}') { depth--; if (depth === 0) { inkSrc = SRC.slice(inkStart, i + 1); break; } }
+    }
+  }
+  const weAccentInk = inkSrc ? new Function('return (' + inkSrc + ')')() : null;
+  let inkUsable = weAccentInk !== null;
+  let inkDetail = '';
+  if (weAccentInk) {
+    try {
+      const yellow = weAccentInk('#FFCF4D');
+      const blue = weAccentInk('#4f8cff');
+      const white = weAccentInk('#ffffff');
+      const black = weAccentInk('#000000');
+      const cYellow = contrast(hex2rgb('#FFCF4D'), hex2rgb(yellow));
+      const cBlue = contrast(hex2rgb('#4f8cff'), hex2rgb(blue));
+      inkUsable = yellow === '#0f1115' && blue === '#ffffff' && white === '#0f1115' && black === '#ffffff'
+        && cYellow >= 7 && cBlue >= 3;
+      inkDetail = 'yellow→' + yellow + '(' + cYellow.toFixed(1) + ':1) blue→' + blue + '(' + cBlue.toFixed(1) + ':1)';
+    } catch (e) { inkUsable = false; inkDetail = String(e && e.message); }
+  }
+  check('C0b the accent-ink function ships and picks a contrast-safe foreground per accent luminance (#127)',
+    inkUsable, 'extracted=' + (inkSrc !== null) + ' ' + inkDetail);
+
+  const FLOOR = {
+    light: lightVars ? Number(lightVars[1]) : NaN,
+    dark: darkVars ? Number(darkVars[1]) : NaN,
+  };
+  const BASE = {
+    light: lightVars ? hex2rgb(lightVars[2]) : null,
+    dark: darkVars ? hex2rgb(darkVars[2]) : null,
+  };
+
+  // ── F2: every text-bearing surface carries the floor, both themes ─────────
+  const surfaceSpecs = [
+    ['composer card token (light)', '--dsw-specific-input-major', 'body[data-we-glass-page]'],
+    ['message bubble token (light)', '--dsw-specific-bubble', 'body[data-we-glass-page]'],
+    ['composer card token (dark)', '--dsw-specific-input-major', 'body[data-ds-dark-theme][data-we-glass-page]'],
+    ['message bubble token (dark)', '--dsw-specific-bubble', 'body[data-ds-dark-theme][data-we-glass-page]'],
+    ['settings window layer 1 (light)', '--dsw-alias-bg-layer-1', 'body[data-we-glass-window]'],
+    ['settings window layer 2 (light)', '--dsw-alias-bg-layer-2', 'body[data-we-glass-window]'],
+    ['settings window layer 3 (light)', '--dsw-alias-bg-layer-3', 'body[data-we-glass-window]'],
+    ['settings window layer 1 (dark)', '--dsw-alias-bg-layer-1', 'body[data-ds-dark-theme][data-we-glass-window]'],
+    ['settings window layer 2 (dark)', '--dsw-alias-bg-layer-2', 'body[data-ds-dark-theme][data-we-glass-window]'],
+    ['settings window layer 3 (dark)', '--dsw-alias-bg-layer-3', 'body[data-ds-dark-theme][data-we-glass-window]'],
+    // #80：壁纸激活时**整窗**的表面令牌也要过下限。它们原本保持宿主实色（因此谈不上
+    // 玻璃、也谈不上"玻璃下的可读性"）；一旦按 #80 在 body[data-we-glass-page] 上映射成
+    // 玻璃配方，它们立刻变成文字面（宿主对话框 / 面板 / 抬高按钮都读这些令牌），
+    // 于是必须与设置窗口那三档同一条下限 —— 否则这次修复会把文字直接放到壁纸上。
+    ['app surface layer 1 (light)', '--dsw-alias-bg-layer-1', 'body[data-we-glass-page]'],
+    ['app surface layer 2 (light)', '--dsw-alias-bg-layer-2', 'body[data-we-glass-page]'],
+    ['app surface layer 3 (light)', '--dsw-alias-bg-layer-3', 'body[data-we-glass-page]'],
+    ['app raised button face (light)', '--dsw-alias-button-elevated-fill', 'body[data-we-glass-page]'],
+    ['app surface layer 1 (dark)', '--dsw-alias-bg-layer-1', 'body[data-ds-dark-theme][data-we-glass-page]'],
+    ['app surface layer 2 (dark)', '--dsw-alias-bg-layer-2', 'body[data-ds-dark-theme][data-we-glass-page]'],
+    ['app surface layer 3 (dark)', '--dsw-alias-bg-layer-3', 'body[data-ds-dark-theme][data-we-glass-page]'],
+    ['app raised button face (dark)', '--dsw-alias-button-elevated-fill', 'body[data-ds-dark-theme][data-we-glass-page]'],
+    // markdown 代码块 / 行内代码（用户口径："代码块和重点文字背景也要和对话框一样玻璃化"）：
+    // 它们以前保持宿主实色、因此不在表内；一旦按玻璃配方映射就成了文字面（shiki 前景色
+    // 压在它上面）⇒ 必须与气泡 / 面板同一条下限，明暗两套都要。
+    ['code block token (light)', '--dsw-alias-markdown-code-block', 'body[data-we-glass-page]'],
+    ['code block banner token (light)', '--dsw-alias-markdown-code-block-banner', 'body[data-we-glass-page]'],
+    ['inline code token (light)', '--dsw-alias-markdown-inline-code', 'body[data-we-glass-page]'],
+    ['markdown tag token (light)', '--dsw-alias-markdown-tag', 'body[data-we-glass-page]'],
+    ['code segment token (light)', '--dsw-alias-markdown-code-segment-unselected', 'body[data-we-glass-page]'],
+    ['selected code segment token (light)', '--dsw-alias-markdown-code-segment-selected', 'body[data-we-glass-page]'],
+    ['code block token (dark)', '--dsw-alias-markdown-code-block', 'body[data-ds-dark-theme][data-we-glass-page]'],
+    ['code block banner token (dark)', '--dsw-alias-markdown-code-block-banner', 'body[data-ds-dark-theme][data-we-glass-page]'],
+    ['inline code token (dark)', '--dsw-alias-markdown-inline-code', 'body[data-ds-dark-theme][data-we-glass-page]'],
+    ['markdown tag token (dark)', '--dsw-alias-markdown-tag', 'body[data-ds-dark-theme][data-we-glass-page]'],
+    ['code segment token (dark)', '--dsw-alias-markdown-code-segment-unselected', 'body[data-ds-dark-theme][data-we-glass-page]'],
+    ['selected code segment token (dark)', '--dsw-alias-markdown-code-segment-selected', 'body[data-ds-dark-theme][data-we-glass-page]'],
+    ['sidebar panel (light)', 'background-color', 'body[data-we-sidebar-glass] [data-dsh-better-sidebar] [class*="_panel"]'],
+    ['sidebar chrome group (light)', 'background-color', 'body[data-we-sidebar-glass] [data-dsh-better-sidebar] [class*="_terminalWrap"]'],
+    ['sidebar panel (dark)', 'background-color', 'body[data-ds-dark-theme][data-we-sidebar-glass] [data-dsh-better-sidebar] [class*="_panel"]'],
+    ['sidebar chrome group (dark)', 'background-color', 'body[data-ds-dark-theme][data-we-sidebar-glass] [data-dsh-better-sidebar] [class*="_terminalWrap"]'],
+    ['native right panel (light)', 'background-color', 'body[data-we-sidebar-glass] [data-sidebar-right-panel]'],
+    ['native right panel (dark)', 'background-color', 'body[data-ds-dark-theme][data-we-sidebar-glass] [data-sidebar-right-panel]'],
+    // 左侧栏液态玻璃（leftSidebarGlass，默认关）：那一列同样是文字面（会话列表 / 工作区），
+    // 一旦接管成玻璃就必须过同一条下限 —— 而且它是**唯一**能直接看到壁纸的大块区域，
+    // 少了这条声明就是"整列文字直接压在花壁纸上"。
+    ['native left column (light)', 'background-color', 'body[data-we-glass-page][data-we-left-sidebar] div:has(> [data-slot="sidebar"])'],
+    ['native left column (dark)', 'background-color', 'body[data-ds-dark-theme][data-we-glass-page][data-we-left-sidebar] div:has(> [data-slot="sidebar"])'],
+    ['plugin repo drawer', 'background-color', '.we-repo-panel--open'],
+  ];
+  const veilMisses = [];
+  for (const [label, prop, selector] of surfaceSpecs) {
+    const rule = ruleFor(prop, selector);
+    const value = rule ? declValue(rule.body, prop) : null;
+    const verdict = hasVeil(value, label);
+    if (!verdict.ok) veilMisses.push(verdict.why);
+  }
+  check('F2a every text-bearing surface token carries the readability floor (veil form)',
+    veilMisses.length === 0,
+    surfaceSpecs.length + ' surface(s) checked · missing/broken=' + veilMisses.length
+      + (veilMisses.length ? ' · ' + JSON.stringify(veilMisses) : ''));
+
+  // The user's chat surfaces must transmit wallpaper at the slider alpha.
+  // Keep protected host-token floor checks above; test the actual overrides
+  // rather than calling an 88% code canvas "transparent glass".
+  {
+    const clean = CSS.replace(/\/\*[\s\S]*?\*\//g, '');
+    const all = [...clean.matchAll(/([^{}]+)\{([^{}]*)\}/g)]
+      .map((m) => ({ header: m[1].trim(), body: m[2] }));
+    const normal = all.filter((r) => !r.header.includes('data-we-glass-fallback')
+      && !r.header.includes('@supports'));
+    const fill = (value) => /rgba\(var\(--we-surface-tint-rgb-(?:light|dark),/.test(value || '')
+      && /var\(--we-glass-alpha,/.test(value || '')
+      && !/readability-floor|max\(/.test(value || '');
+    const fills = normal.filter((r) => r.header === 'body[data-we-glass-page]'
+      || r.header === 'body[data-ds-dark-theme][data-we-glass-page]')
+      .map((r) => declValue(r.body, '--we-chat-glass-fill')).filter(Boolean);
+    check('F2c chat fill uses the slider directly in both themes, no opacity floor',
+      fills.length === 2 && fills.every(fill));
+    check('negative control: the rejected 88% canvas fails the transparency contract',
+      fills.length === 2 && !fill(fills[0].replace(/var\(--we-glass-alpha, [^)]+\)/, '0.88')));
+    // 2026-10-04 用户口径：输入框退出思考玻璃作用域 ⇒ fill 接管的名单只剩
+    // 气泡与两类代码围栏；输入卡在挂门规则里出现一次就算红（双向判据）。
+    const roots = ['[class*="_bubble"]',
+      '[data-chat-flow] .md-code-block', ':has(> pre > code)'];
+    check('F2d bubble and message fences retain their slider fill; composer stays outside the thinking-glass scope',
+      roots.every((anchor) => normal.some((r) => r.header.includes(anchor)
+        && /background(?:-color)?: var\(--we-chat-glass-fill\)/.test(r.body)))
+      && !normal.some((r) => r.header.includes('data-we-thinking-glass')
+        && r.header.includes('[data-composer-card]')));
+    const clear = (body) => /background: transparent !important/.test(body)
+      && /(?:^|[;\s])backdrop-filter: none !important/.test(body)
+      && /-webkit-backdrop-filter: none !important/.test(body)
+      && !/(?:^|[;\s])opacity\s*:/.test(body);
+    check('F2d2 reasoning and both file-card roots have no tint or backdrop blur',
+      ['[data-vcp-reasoning]', '[data-changed-files]', '[data-presented-file]']
+        .every((anchor) => normal.some((r) => r.header.includes(anchor) && clear(r.body))));
+    // ⚠️ v1.3.0 追版（本仓「思考触发条」面与上游 #134 的收敛口径）：`[data-turn-trigger]` **刻意
+    //   不在上面那一组** —— 上游原稿把思考触发条与推理面一起做成"清底 + 无霜"，本仓把它做成
+    //   "吃玻璃、可独立配置"的面（接管宿主专属令牌 `--dsw-alias-turn-trigger-bg` / `-hover`
+    //   + 在锚点元素上挂模糊载体），门与那一组**相同**（`data-we-thinking-glass`，默认关）。
+    //   两头都钉：① 它不得落进"清底 + 无霜"那组（否则我们的玻璃整组被 !important 压掉）；
+    //   ② 它必须真的接了玻璃（令牌 + 模糊），而不是"摘出清底组之后什么都不剩"。
+    check('F2d2b 思考触发条刻意不在清底组，且真的接了玻璃（令牌 + 模糊载体，门同为 thinking-glass）',
+      !normal.some((r) => r.header.includes('[data-turn-trigger]') && clear(r.body))
+      && normal.some((r) => r.header.includes('[data-we-thinking-glass]')
+        && r.header.includes('[data-turn-trigger]')
+        && /var\(--we-thinking-trigger-blur/.test(r.body)
+        && /backdrop-filter: blur\(/.test(r.body))
+      && normal.some((r) => r.header.includes('[data-we-thinking-glass]')
+        && /--dsw-alias-turn-trigger-bg:/.test(r.body)
+        && /var\(--we-thinking-trigger-alpha/.test(r.body)));
+    check('negative control: a tinted reasoning/file bar is not fully transparent',
+      !clear('background: rgba(28, 28, 28, 0.19) !important; backdrop-filter: none !important; -webkit-backdrop-filter: none !important;'));
+    const chip = normal.find((r) => r.header.includes('[data-chat-flow] :not(pre) > code')
+      && r.header.includes('[data-vcp-rawhtml] :not(pre) > code'));
+    check('F2d3 inline capsules restore ten-percent white mist and independent 8px frost',
+      normal.some((r) => r.header === 'body[data-we-glass-page][data-we-thinking-glass]'
+        && declValue(r.body, '--dsw-alias-markdown-inline-code') === 'var(--we-capsule-glass-fill)')
+      && normal.some((r) => r.header === 'body[data-we-glass-page]'
+        && declValue(r.body, '--we-capsule-glass-fill') === 'rgba(var(--we-capsule-tint-rgb, 255, 255, 255), var(--we-inline-code-alpha, 0.10))')
+      && !!chip && /background: var\(--dsw-alias-markdown-inline-code\) !important/.test(chip.body)
+      && declValue(chip.body, 'backdrop-filter') === 'blur(var(--we-inline-code-blur, 8px)) saturate(var(--we-saturate, 1.3)) brightness(var(--we-glass-brightness, 1.04))'
+      && declValue(chip.body, '-webkit-backdrop-filter') === declValue(chip.body, 'backdrop-filter')
+      && declValue(chip.body, 'background-image') === 'none !important'
+      && declValue(chip.body, 'border-color') === 'rgba(255, 255, 255, 0.14) !important'
+      && !/(?:^|[;\s])(?:color|filter|opacity)\s*:/.test(chip.body));
+    const tools = normal.find((r) => declValue(r.body, 'background-color') === 'var(--we-tool-glass-fill) !important');
+    const toolScope = (header) => header.split(',').every((selector) =>
+      selector.includes('[data-we-glass-page][data-we-thinking-glass]') && selector.includes('[data-chat-flow]')
+      && (selector.includes('[data-slot="tool.call.toolview"]') || selector.includes('[data-chat-flow-kind="context"]')));
+    check('F2d4 all seven tool result bodies are scoped to their chat slots and gates',
+      !!tools && tools.header.split(',').length === 7 && toolScope(tools.header)
+      && ['[data-context-injection-body]', '[data-terminal]', '[data-read]', '[data-search="matches"]',
+        '[data-variant="others"]', '[data-search="paths"]', '[data-diff]'].every((a) => tools.header.includes(a)));
+    check('F2d4b generic IO glass covers the others family in normal and fallback modes',
+      all.filter((r) => r.header.includes('[class*="_ioCard"]')).length === 2
+      && all.filter((r) => r.header.includes('[class*="_ioCard"]'))
+        .every((r) => r.header.includes('[data-variant="others"]') && !r.header.includes('[data-tool="tool_call"]')));
+    check('negative control: tool glass without its chat-slot boundary is rejected',
+      !!tools && !toolScope(tools.header.replaceAll('[data-slot="tool.call.toolview"]', '')));
+    check('F2d5 tool bodies retain theme tint, add six opacity points and clear nested canvases',
+      ['light', 'dark'].every((theme) => normal.some((r) =>
+        new RegExp('--we-tool-glass-fill: rgba\\(var\\(--we-surface-tint-rgb-' + theme + ',').test(r.body)
+        && /calc\(var\(--we-glass-alpha, 0\.15\) \+ 0\.06\)/.test(r.body)))
+      && !!tools && declValue(tools.body, '--dsw-alias-markdown-code-block') === 'transparent'
+      && declValue(tools.body, '--dsw-alias-markdown-code-block-banner') === 'transparent'
+      && declValue(tools.body, '--dsl-code-block-background') === 'transparent'
+      && !/(?:^|[;\s])(?:color|filter|opacity)\s*:/.test(tools.body));
+    const fences = all.filter((r) => r.header.includes('.md-code-block') || r.header.includes(':has(> pre > code)'));
+    const gated = (h) => h.split(',').every((s) => s.includes('[data-we-glass-page]') && s.includes('[data-we-thinking-glass]'));
+    check('F2e fence rules are opt-in and message-scoped',
+      fences.length >= 5 && fences.every((r) => gated(r.header))
+      && fences.every((r) => r.header.includes('[data-chat-flow]') || r.header.includes('[data-vcp-rawhtml]')));
+    check('negative control: unguarded fence rules are rejected',
+      !!fences[0] && !gated(fences[0].header.replaceAll('[data-we-thinking-glass]', '')));
+    const native = normal.filter((r) => r.header.includes('.md-code-block') && !r.header.includes('> pre {'));
+    check('F2f native Shiki foregrounds remain untouched; inner canvas is transparent',
+      native.every((r) => !/(?:^|[;\s])(?:color|filter|opacity|mix-blend-mode)\s*:/.test(r.body))
+      && normal.some((r) => r.header.includes('.md-code-block pre')
+        && /background: transparent !important/.test(r.body) && /backdrop-filter: none !important/.test(r.body))
+      && normal.some((r) => r.header.includes('[data-vcp-reasoning-body]')
+        && /background: transparent !important/.test(r.body) && /backdrop-filter: none !important/.test(r.body)));
+    check('F2g VCP plain code follows theme foreground; 92% plate is fallback-only',
+      normal.some((r) => r.header.includes('[data-vcp-rawhtml]') && r.header.endsWith('> pre')
+        && /color: var\(--dsw-alias-label-primary\) !important/.test(r.body))
+      && all.some((r) => r.header.includes('data-we-glass-fallback')
+        && /--we-chat-glass-fill: color-mix\(in srgb, var\(--we-readability-base\) 92%, transparent\)/.test(r.body)));
+  }
+
+  // 负对照（DEV-GUIDE §4.7 约定 5：变异输入必须喂进**同一条判据**）：把一条真实声明改坏
+  // （把下限那一项换成玻璃色）后，`hasVeil` 必须判不合格 —— 否则 F2a 可能是空转的
+  // （选择器一改名，spec 全落空也没人发现）。
+  {
+    const rule = ruleFor('--dsw-alias-bg-layer-1', 'body[data-we-glass-page]');
+    const real = rule ? declValue(rule.body, '--dsw-alias-bg-layer-1') : null;
+    const mutated = String(real).replace('var(--we-readability-base)', 'var(--we-glass-color, #ffffff)');
+    check('negative control: 同一条下限判据对"被改坏的声明"有牙',
+      real !== null && mutated !== real
+      && hasVeil(real, 'real').ok === true && hasVeil(mutated, 'mutated').ok === false,
+      'real=' + String(real).slice(0, 64) + ' · mutated=' + mutated.slice(0, 64));
+  }
+
+  const darkComposer = ruleFor('--dsw-specific-input-major', 'body[data-ds-dark-theme][data-we-glass-page]');
+  // 对话栏解耦（chatGlassFidelity）后，composer/bubble 的深色档消费 --we-chat-* 变量对。
+  const DARK_FACTOR = darkComposer
+    ? Number((declValue(darkComposer.body, '--dsw-specific-input-major')
+      .match(/rgba\(var\(--we-chat-surface-tint-rgb-dark, 255, 255, 255\), calc\(var\(--we-glass-alpha, [\d.]+\) \* ([\d.]+)\)\)/) || [])[1])
+    : NaN;
+  check('F2b the veil keeps a fixed weight while the tint keeps its own alpha (dark ×factor preserved)',
+    /rgba\(var\(--we-chat-surface-tint-rgb-dark, 255, 255, 255\), calc\(var\(--we-glass-alpha, 0\.15\) \* 0\.4\)\)/.test(declValue(darkComposer ? darkComposer.body : '', '--dsw-specific-input-major') || '')
+      && /calc\(var\(--we-chat-readability-floor\) \* 100%\)/.test(declValue(darkComposer ? darkComposer.body : '', '--dsw-specific-input-major') || ''),
+    'dark tint factor=' + DARK_FACTOR);
+
+  // ── F3: the content plate uses a literal max() clamp on its own alpha ──────
+  const contentProp = 'background-color';
+  const contentRules = rulesWithProp(contentProp)
+    .filter((r) => /\.cm-editor|xterm|\.dshDesktopSidebarSurface/.test(r.header));
+  const CONTENT_TOKEN = 'max(calc(var(--we-readability-floor) * 100%), var(--we-content-surface-alpha, 88%))';
+  check('F3 the editor/terminal content plate clamps its own alpha with max()',
+    contentRules.length >= 3 && contentRules.every((r) => r.body.includes(CONTENT_TOKEN)),
+    contentRules.length + ' content rule(s), all carrying ' + CONTENT_TOKEN);
+
+  // ── F4: the software-render fallback plate still clears the floor ─────────
+  const fbRule = rulesWithProp(contentProp)
+    .find((r) => r.header.includes('[data-we-glass-fallback]') && r.header.includes('[data-composer-card]::before'));
+  const fbPlatePct = fbRule
+    ? Number((fbRule.body.match(/color-mix\(in srgb, var\(--we-surface-tint-(?:light|dark), (#[0-9a-fA-F]{6})\) (\d+)%, transparent\)/) || [])[2])
+    : NaN;
+  check('F4 the software-render fallback plate (#95) still clears the floor',
+    fbPlatePct / 100 >= Math.max(FLOOR.light, FLOOR.dark),
+    'fallback plate=' + (isNaN(fbPlatePct) ? 'missing' : fbPlatePct + '%') + ' · floor=' + Math.max(FLOOR.light, FLOOR.dark));
+
+  // ── F5: DSH Desktop 的外壳画布底必须被清掉 ─────────────────────────────────
+  // 壳层样式表里有一条**模式门控**规则（兼容模式没有，所以只有那个模式会把壁纸
+  // 整片盖住 → 用户看到的就是「没选壁纸」）：
+  //   body[data-dsh-desktop-mode="extended"] .dshDesktopFrame            { background: var(--dsh-desktop-frame-fill) }
+  //   body[data-dsh-desktop-mode="extended"] .dshDesktopConversationSurface { background: var(--dsw-alias-bg-base) }
+  // Windows 上 material 只能是 off ⇒ --dsh-desktop-frame-fill = --dsw-alias-bg-layer-1（不透明）。
+  // 主内容区那条读 --dsw-alias-bg-base，插件已在 body[data-we-wallpaper] 上置 transparent，
+  // 所以这里只要守住**画布**那一层被清掉（且用的是 transparent，不是某个不透明色）。
+  // ⚠️ 插件侧**不得**跟着写模式门控：模式名与门控集合由壳层自己演进，钉住某一个模式名
+  // 一旦漂移就是"整片盖住壁纸"。判据因此要求选择器里**没有** data-dsh-desktop-mode ——
+  // 两个方向都有牙：漏清（无规则）红，写回单一模式门控也红。
+  // ⚠️ 本仓的 CSS 规则解析器把**前置注释**也算进 header，所以判据必须先剥注释再匹配选择器
+  // —— 否则我在这条规则上方写的那段说明注释本身就含 `.dshDesktopFrame`，断言会靠注释过关
+  //（"负对照空转"的老坑）。三条负对照：同形但不含 transparent / 只在注释里出现选择器 /
+  // 写回单一模式门控的那一版。
+  const selOf = (r) => String(r.header).replace(/\/\*[\s\S]*?\*\//g, '');
+  const clearsShellFrame = (r) => {
+    const h = selOf(r);
+    return h.includes('[data-we-wallpaper]') && h.includes('data-we-adapter^="desktop-"')
+      && h.includes('.dshDesktopFrame') && /transparent/.test(r.body)
+      && !h.includes('data-dsh-desktop-mode');
+  };
+  const shellFrameRules = rulesWithProp('background').filter(clearsShellFrame);
+  const shellDecoy = { header: 'body[data-we-wallpaper] .dshDesktopFrame', body: 'background: var(--dsh-desktop-frame-fill) !important;' };
+  const commentDecoy = { header: '/* body[data-we-wallpaper] .dshDesktopFrame */ body', body: 'background: transparent;' };
+  const modeGatedDecoy = { header: 'body[data-we-adapter^="desktop-"][data-we-wallpaper][data-dsh-desktop-mode="extended"] .dshDesktopFrame', body: 'background: transparent !important;' };
+  check('F5 桌面壳的外壳画布底被清掉（否则整窗盖住壁纸 = 像没选壁纸），且不钉模式名',
+    shellFrameRules.length >= 1 && !clearsShellFrame(shellDecoy) && !clearsShellFrame(commentDecoy)
+      && !clearsShellFrame(modeGatedDecoy),
+    shellFrameRules.length + ' rule(s): ' + shellFrameRules.map((r) => selOf(r).slice(-64)).join(' | ')
+      + ' · 负对照[不透明]=' + (clearsShellFrame(shellDecoy) ? 'FAIL' : 'ok')
+      + ' · 负对照[仅注释]=' + (clearsShellFrame(commentDecoy) ? 'FAIL' : 'ok')
+      + ' · 负对照[钉住单一模式名]=' + (clearsShellFrame(modeGatedDecoy) ? 'FAIL' : 'ok'));
+
+  // ── F6: 画布兜底色必须落在 html 上 ─────────────────────────────────────────
+  // 「壁纸的像素没送到屏上」时的最后一道底：根元素的背景色就是**画布背景**（合成器直接
+  // 填充的纯色 quad，不依赖栅格），掉层时它还在。落在 body 上等于没写 —— 宿主有一条
+  //   html[data-platform=darwin] body { background: transparent }
+  // 在层叠上赢过 body 侧的任何声明（选择器多一层 html[data-platform]），而 darwin 正是
+  // 桌面壳的主场。判据读的是**规则体**，所以自带负对照：把承载规则原地换成 body 之后必须判不出来。
+  const underlayCarrierOf = (css) => {
+    const at = css.indexOf('background-color: var(--we-wallpaper-underlay');
+    if (at < 0) return null;
+    const open = css.lastIndexOf('{', at);
+    if (open < 0) return null;
+    const prevClose = css.lastIndexOf('}', open);
+    const header = String(css.slice(prevClose + 1, open));
+    // header 可能**从一段注释中间**开始（规则的注释写在它上方，而这一刀切在上一条规则的 } 之后）
+    // ⇒ 先砍掉尾部那段注释，再按"整段注释"兜底。
+    const cut = header.includes('*/') ? header.slice(header.lastIndexOf('*/') + 2) : header;
+    return cut.replace(/\/\*[\s\S]*?\*\//g, '').trim();
+  };
+  const carrier = underlayCarrierOf(CSS);
+  const swapped = (() => {
+    const at = CSS.indexOf('background-color: var(--we-wallpaper-underlay');
+    if (at < 0) return '';
+    const open = CSS.lastIndexOf('{', at);
+    const start = CSS.lastIndexOf('}', open) + 1;
+    return CSS.slice(0, start) + ' body ' + CSS.slice(open);
+  })();
+  check('F6 画布兜底色落在 html 元素上（body 侧会被宿主 darwin 的透明规则盖掉）',
+    carrier === 'html' && underlayCarrierOf(swapped) !== 'html',
+    'carrier=' + JSON.stringify(carrier) + ' · 负对照[换成 body]=' + (underlayCarrierOf(swapped) === 'html' ? 'FAIL' : 'ok'));
+
+  // ── C1/C2: the grid — 染色地板网格：玻璃色 {黑/中灰/白} × 滑杆五档 × 主题 ──
+  // 表面 = 染色地板（base 与 frost 同为钳制后的 tint，见样式表令牌映射），
+  // alpha = F + w(1−F)（w = glassAlpha，深色再乘 0.4 层因子）。判据不变：
+  // 最坏背衬（深色白壁纸像素 / 浅色黑壁纸像素）上正文 ≥4.5:1 —— 测的是
+  // **任意玻璃色**（三档极端输入覆盖钳制的全部路径），不是单一白色 frost 点。
+  check('C1a the glass-alpha mapping was derived from the source',
+    glassAlpha !== null, 'mapping=' + JSON.stringify(GMAP ? GMAP.slice(1) : null));
+
+  const alphaTable = { light: [], dark: [] };
+  const contrastTable = { light: [], dark: [] };
+  let alphaOk = true, contrastOk = true;
+  const worstAt = { light: [], dark: [] };
+  if (clampUsable) {
+    for (const theme of ['light', 'dark']) {
+      const F = FLOOR[theme];
+      for (const gp of GRID_GLASS) {
+        const g = glassAlpha(gp);
+        const w = theme === 'dark' ? g * DARK_FACTOR : g;
+        const alpha = F + w * (1 - F);
+        if (!(alpha >= F)) alphaOk = false;
+        if (theme === 'light') alphaTable.light.push(Number(alpha.toFixed(4)));
+        if (theme === 'dark') alphaTable.dark.push(Number(alpha.toFixed(4)));
+        // 壁纸透明度 only changes the BACKDROP (never the surface): worst case is
+        // the fully opaque extreme wallpaper pixel.
+        for (const gc of CLAMP_COLORS) {
+          const tint = tintOf[theme + ' ' + gc];
+          let worst = Infinity;
+          for (const wp of GRID_WP) {
+            const backdrop = over(WORST_PIXEL[theme], 1 - wp / 100, PAGE_BASE[theme]);
+            worst = Math.min(worst, contrast(TEXT[theme], over(tint, alpha, backdrop)));
+          }
+          if (!(worst >= 4.5)) contrastOk = false;
+          worstAt[theme].push(theme + ' ' + gc + ' @' + gp + ' → ' + worst.toFixed(2) + ':1');
+        }
+      }
+    }
+  }
+  check('C1b full grid: effective composer-surface alpha ≥ floor (玻璃透明度 × 壁纸透明度 × theme)',
+    alphaOk && clampUsable,
+    'light α=' + alphaTable.light.join('/') + ' (floor ' + FLOOR.light + ') · dark α='
+      + alphaTable.dark.join('/') + ' (floor ' + FLOOR.dark + ')');
+  check('C1c full grid: worst-case WCAG contrast of body text ≥ 4.5:1 (玻璃色 黑/中灰/白 × 滑杆 × 主题 × 壁纸透明度)',
+    contrastOk && clampUsable,
+    worstAt.light.slice(0, 3).concat(worstAt.dark.slice(0, 3)).join(' · ')
+      + ' … 共 ' + worstAt.light.length + '×2 格 (worst backdrop: light #000, dark #fff)');
+
+  check('C2 the floor is NOT reduced at 玻璃透明度 = 60 (most transparent end)',
+    alphaTable.light[GRID_GLASS.length - 1] >= FLOOR.light
+      && alphaTable.dark[GRID_GLASS.length - 1] >= FLOOR.dark
+      && alphaTable.light[GRID_GLASS.length - 1] === Math.min(...alphaTable.light)
+      && alphaTable.dark[GRID_GLASS.length - 1] === Math.min(...alphaTable.dark),
+    'min alpha light=' + Math.min(...alphaTable.light) + ' dark=' + Math.min(...alphaTable.dark)
+      + ' vs floors ' + FLOOR.light + '/' + FLOOR.dark);
+
+  // ── C3: independence from 壁纸透明度 ──────────────────────────────────────
+  // One composite step that takes the 壁纸透明度-driven backdrop as an INPUT, so
+  // "the alpha does not move" is a property of the code path, not of a constant
+  // compared with itself (the contrast half DOES move, proving wp is exercised).
+  function surfaceFor(theme, gp, wp) {
+    const g = glassAlpha(gp);
+    const w = theme === 'dark' ? g * DARK_FACTOR : g;
+    const backdrop = over(WORST_PIXEL[theme], 1 - wp / 100, PAGE_BASE[theme]);
+    const tint = tintOf[theme + ' #7f7f7f'];
+    const alpha = FLOOR[theme] + w * (1 - FLOOR[theme]);
+    return {
+      alpha,
+      contrast: contrast(TEXT[theme], over(tint, alpha, backdrop)),
+    };
+  }
+  const floorDeclRules = surfaceSpecs
+    .map(([, prop, selector]) => ruleFor(prop, selector))
+    .filter(Boolean);
+  const floorText = floorDeclRules.map((r) => r.header + ' { ' + r.body + ' }').join('\n')
+    + '\n' + (lightVars ? lightVars[0] : '') + (darkVars ? darkVars[0] : '');
+  const wpLeak = /--we-wallpaper-opacity/.test(floorText);
+  const alphaPerWp = GRID_WP.map((wp) => Number(surfaceFor('light', 30, wp).alpha.toFixed(6)));
+  const contrastPerWp = GRID_WP.map((wp) => Number(surfaceFor('light', 30, wp).contrast.toFixed(2)));
+  check('C3a the floor never reads --we-wallpaper-opacity: surface alpha is identical for 壁纸透明度 {0,50,90}',
+    !wpLeak && new Set(alphaPerWp).size === 1 && new Set(contrastPerWp).size > 1,
+    'floor declarations mention --we-wallpaper-opacity=' + wpLeak
+      + ' · α=' + alphaPerWp.join('/') + ' (identical) · backdrop contrast=' + contrastPerWp.join('/') + ' (moves)');
+  // ── C3b: the slider stays scoped to the wallpaper layer only ─────────────
+  // 上游 v0.7.5 起淡出改在**媒体叶子**上（.we-layer .we-media）：.we-layer 保持
+  // 不透明并垫主题实色（--we-wallpaper-fade-bg），因为透明 backdrop 会让
+  // backdrop-filter（玻璃模糊）失效。语义不变 —— 仍只作用于壁纸层、不碰文字面。
+  const layerRule = rulesWithProp('background-color').find((r) => /\.we-layer\s*$/.test(r.header));
+  const mediaFadeRule = rulesWithProp('opacity').find((r) => /\.we-layer\s+\.we-media\s*$/.test(r.header));
+  check('C3b 壁纸透明度 stays scoped to the wallpaper layer (opaque padded layer + fade on the media leaf)',
+    layerRule !== undefined
+      && declValue(layerRule.body, 'opacity') === '1'
+      && /^var\(--we-wallpaper-fade-bg/.test(String(declValue(layerRule.body, 'background-color')))
+      && mediaFadeRule !== undefined
+      && mediaFadeRule.body.includes('opacity: var(--we-wallpaper-opacity, 1)'),
+    '.we-layer opacity=' + JSON.stringify(layerRule && declValue(layerRule.body, 'opacity'))
+      + ' · bg=' + JSON.stringify(layerRule && declValue(layerRule.body, 'background-color'))
+      + ' · .we-layer .we-media opacity=' + JSON.stringify(mediaFadeRule && declValue(mediaFadeRule.body, 'opacity')));
+
+  // ── C4: the slider is not flattened above the floor ──────────────────────
+  const strictlyDecreasing = (arr) => arr.every((v, i) => i === 0 || v < arr[i - 1]);
+  // content plate: user alphas above the floor must pass through unchanged.
+  const userAlphas = [20, 30, 45, 50, 70, 88, 100];
+  const clamped = userAlphas.map((p) => Math.max(FLOOR.light * 100, p));
+  const passThrough = userAlphas.every((p, i) => p <= FLOOR.light * 100 || clamped[i] === p);
+  const everAboveFloor = userAlphas.some((p) => p > FLOOR.light * 100);
+  check('C4a the content plate is not flattened: user alphas above the floor pass through unchanged',
+    passThrough && everAboveFloor && clamped.every((v) => v >= FLOOR.light * 100),
+    'user=' + userAlphas.join('/') + ' → effective=' + clamped.join('/') + ' (floor ' + (FLOOR.light * 100) + '%)');
+  check('C4b 玻璃透明度 still changes the effective alpha monotonically (no flattening)',
+    strictlyDecreasing(alphaTable.light) && strictlyDecreasing(alphaTable.dark),
+    'light ' + alphaTable.light.join(' > ') + ' · dark ' + alphaTable.dark.join(' > '));
+
+  // ── C5: the dark ×0.4 factor cannot undercut the floor ───────────────────
+  const darkNoTint = veil([255, 255, 255], 0, [0, 0, 0], FLOOR.dark);
+  check('C5 the dark-theme tint factor cannot lower the veil (floor holds even at tint alpha 0)',
+    Math.abs(darkNoTint.alpha - FLOOR.dark) < 1e-12 && FLOOR.dark > DARK_FACTOR,
+    'veil alpha at tint 0 = ' + darkNoTint.alpha + ' · floor=' + FLOOR.dark + ' > tint factor=' + DARK_FACTOR);
+
+  // ── M1: discriminating power — the un-floored tint FAILS ─────────────────
+  let beforeWorst = Infinity, beforeAt = null;
+  let clampCeiling = 0;
+  for (const theme of ['light', 'dark']) {
+    for (const gp of GRID_GLASS) {
+      const g = glassAlpha(gp);
+      const w = theme === 'dark' ? g * DARK_FACTOR : g;
+      for (const wp of GRID_WP) {
+        const backdrop = over(WORST_PIXEL[theme], 1 - wp / 100, PAGE_BASE[theme]);
+        const cr = contrast(TEXT[theme], over([255, 255, 255], w, backdrop));
+        if (cr < beforeWorst) { beforeWorst = cr; beforeAt = theme + ' @ 玻璃透明度=' + gp + ', 壁纸透明度=' + wp + ', α=' + w.toFixed(4); }
+      }
+      // What a max() clamp on the TINT alpha could do at best in dark mode: the
+      // glaze is white, so over the brightest pixel it is white at every alpha.
+      if (theme === 'dark') {
+        clampCeiling = Math.max(clampCeiling,
+          contrast(TEXT.dark, over([255, 255, 255], Math.max(FLOOR.dark, w), WORST_PIXEL.dark)));
+      }
+    }
+  }
+  check('M1 the OLD (un-floored) surface really fails 4.5:1 — this assertion has teeth',
+    beforeWorst < 4.5 && clampCeiling < 4.5,
+    'worst before=' + beforeWorst.toFixed(2) + ':1 (' + beforeAt + ') · worst after='
+      + Math.min(...contrastTable.light, ...contrastTable.dark).toFixed(2) + ':1'
+      + ' · best a max() clamp on the dark tint could reach=' + clampCeiling.toFixed(2) + ':1 (why the floor is a layer)');
+
+  // ── M2: maths helpers, positive + negative controls ──────────────────────
+  const controls = [
+    ['black on white = 21', Math.abs(contrast([0, 0, 0], [255, 255, 255]) - 21) < 0.01],
+    ['white on white = 1', Math.abs(contrast([255, 255, 255], [255, 255, 255]) - 1) < 0.01],
+    ['veil alpha additive', Math.abs(veil([0, 0, 0], 0.5, [255, 255, 255], 0.5).alpha - 0.75) < 1e-12],
+    ['veil colour is the base over the tint', veil([0, 0, 0], 0, [255, 255, 255], 0.5).color.join() === '255,255,255'],
+    ['veil at tint 0 = base only', veil([0, 0, 0], 0, [0, 0, 0], 0.59).alpha === 0.59],
+    ['negative control: 0.3 veil fails 4.5:1', contrast([0, 0, 0], over([255, 255, 255], 0.3, [0, 0, 0])) < 4.5],
+  ];
+  const bad = controls.filter(([, ok]) => !ok).map(([name]) => name);
+  check('M2 contrast/veil helpers hold their positive + negative controls',
+    bad.length === 0, controls.length + ' controls, failed=[' + bad.join(', ') + ']');
+
+  // ── C6: stylesheet integrity + the wallpaper layer can never cover the UI ──
+  // 一次未闭合的 `/*` 会把其后的规则**整段静默吞掉**（CSS 注释不嵌套，故必然造成
+  // `/*` 多于 `*/`）: 实测这让 .we-layer 丢掉 position:fixed/z-index:-2 —— 壁纸于是
+  // 掉进文档流（视频跑到页面底部）或直接盖住文字层。解析器不会为此报任何错。
+  // 判据用两条: ①注释配平; ②**剥掉注释后**关键规则仍然在, 且仍是 fixed 负 z-index。
+  {
+    const opens = (CSS.match(/\/\*/g) || []).length;
+    const closes = (CSS.match(/\*\//g) || []).length;
+    const stripped = CSS.replace(/\/\*[\s\S]*?\*\//g, '');
+    const layerBody = (stripped.match(/\.we-layer\s*\{([^}]*)\}/) || [])[1] || '';
+    const pos = (layerBody.match(/position:\s*([a-z-]+)/) || [])[1] || null;
+    const z = (layerBody.match(/z-index:\s*(-?\d+)/) || [])[1] || null;
+    check('C6s comment balance + .we-layer survives comment-stripping as position:fixed with a negative z-index',
+      opens === closes && pos === 'fixed' && Number(z) < 0,
+      'comments ' + opens + '/' + closes + ' · .we-layer position=' + JSON.stringify(pos)
+        + ' z-index=' + JSON.stringify(z));
+  }
+
+  // ── F7: 侧栏全透明（issue #137）—— 放弃地板的显式开关链路（默认关）──────
+  // 与上面所有判据互为反向：F1–F5/C* 钉"地板在"，F7 钉"地板只能被这个开关
+  //（且仅在壁纸下、仅侧栏子树）拿掉"。全部从**产物**取（schema/glass/effects/
+  // panel 都内联在 lib/client.js 里），不重打字。
+  {
+    const clean = CSS.replace(/\/\*[\s\S]*?\*\//g, '');
+    const allRules = [...clean.matchAll(/([^{}]+)\{([^{}]*)\}/g)]
+      .map((m) => ({ header: m[1].trim().replace(/\s+/g, ' '), body: m[2] }));
+    const fcRules = allRules.filter((r) => r.header.includes('data-we-sidebar-fullclear'));
+    check('F7a 全透明规则组在位（≥3 条）且每条都带壁纸门（无壁纸时不生效）',
+      fcRules.length >= 3 && fcRules.every((r) => r.header.includes('data-we-wallpaper')),
+      fcRules.length + ' 条 · 缺壁纸门 ' + fcRules.filter((r) => !r.header.includes('data-we-wallpaper')).length);
+    // 容器覆盖：六变量归零（地板 / 色染 / 釉光三组）—— 面板 color-mix 与渐变靠它透掉。
+    const container = fcRules.find((r) => r.header.includes('[data-dsh-better-sidebar]'));
+    const ZEROS = ['--we-readability-floor: 0', '--we-sidebar-tint: 0%',
+      '--we-sidebar-color: transparent', '--we-sidebar-sheen: 0',
+      '--we-sidebar-sheen-a: 0', '--we-sidebar-sheen-b: 0', '--we-sidebar-sheen-c: 0'];
+    check('F7b 容器覆盖规则把地板/色染/釉光六个变量归零',
+      !!container && ZEROS.every((z) => container.body.includes(z)),
+      container ? ZEROS.filter((z) => !container.body.includes(z)).join(' | ') || '六项齐' : '规则缺失');
+    // 显式接管：右栏那条必须是**画底色**的规则（容器覆盖那条也含 panel 选择器但只写变量）。
+    const rp = fcRules.find((r) => r.header.includes('[data-sidebar-right-panel]')
+      && r.body.includes('background-color'));
+    check('F7c 右栏显式接管：展开态门 + 透明 !important + 釉光关掉',
+      !!rp && rp.header.includes('[data-sidebar-right-open]')
+      && rp.body.includes('background-color: transparent !important')
+      && rp.body.includes('background-image: none !important'),
+      rp ? rp.header.slice(0, 100) : '规则缺失');
+    // 左栏：一条规则两个选择器（浅 + 深）—— 按**选择器**数，不按规则条数。
+    const leftRule = fcRules.find((r) => r.header.includes('data-we-left-sidebar'));
+    const leftSels = leftRule ? leftRule.header.split(',').filter((h) => h.includes('data-we-left-sidebar')) : [];
+    check('F7d 左栏显式接管：浅深两个选择器都在（深色带 data-ds-dark-theme 提权压软件渲染兜底）',
+      leftSels.length === 2 && leftSels.some((h) => h.includes('data-ds-dark-theme'))
+      && leftRule.body.includes('background-color: transparent !important'),
+      '选择器 ' + leftSels.length + ' 个');
+    // 链路：默认关（安全不变量）+ 成对挂摘 + UI 行过 weT。
+    check('F7e 设置键默认关且 kind 为 boolFalse（默认态地板照旧兜底）',
+      /sidebarFullClear:\s*false,/.test(SRC) && /sidebarFullClear:\s*\{\s*kind:\s*'boolFalse'\s*\}/.test(SRC));
+    const sets = (SRC.match(/setAttribute\("data-we-sidebar-fullclear"/g) || []).length;
+    const rems = (SRC.match(/removeAttribute\("data-we-sidebar-fullclear"/g) || []).length;
+    const paired = SRC.includes('else document.body.removeAttribute("data-we-sidebar-fullclear")');
+    check('F7f 门控属性有挂有摘：applyGlass 成对（if/else）+ clearEffects 卸载再摘一次（rem ≥2）',
+      sets >= 1 && paired && rems >= 2, 'set=' + sets + ' rem=' + rems + ' paired=' + paired);
+    check('F7g UI 行存在且文案过 weT（新中文必须进 weT + 词表）',
+      /weT\("侧栏全透明"\)/.test(SRC) && /"侧栏全透明":\s*"/.test(SRC));
+    // 负对照：把上面几条判据各自喂坏输入，必须判出（判据不是恒真）。
+    const gateOk = (r) => r.header.includes('data-we-wallpaper');
+    check('negative control F7-1: 缺壁纸门的全透明规则会被同一条判据判出',
+      !gateOk({ header: 'body[data-we-sidebar-fullclear] [data-dsh-better-sidebar]' })
+      && fcRules.every(gateOk));
+    const defaultOk = (src) => /sidebarFullClear:\s*false,/.test(src)
+      && /sidebarFullClear:\s*\{\s*kind:\s*'boolFalse'\s*\}/.test(src);
+    check('negative control F7-2: 默认 true（地板默认被拿掉）或缺 kind 会被同一条判据判出',
+      !defaultOk('sidebarFullClear: true, sidebarFullClear: { kind: \'boolFalse\' }')
+      && !defaultOk('sidebarFullClear: false,')
+      && defaultOk(SRC));
+    const zerosOk = (body) => ZEROS.every((z) => body.includes(z));
+    check('negative control F7-3: 六变量缺一项会被同一条判据判出',
+      !zerosOk(ZEROS.slice(1).join('; ')) && zerosOk(container ? container.body : ''));
+    const unpairOk = (src) => (src.match(/setAttribute\("data-we-sidebar-fullclear"/g) || []).length >= 1
+      && src.includes('else document.body.removeAttribute("data-we-sidebar-fullclear")')
+      && (src.match(/removeAttribute\("data-we-sidebar-fullclear"/g) || []).length >= 2;
+    check('negative control F7-4: 只挂不摘（漏 clearEffects 那次）会被同一条判据判出',
+      !unpairOk('setAttribute("data-we-sidebar-fullclear","on"); else document.body.removeAttribute("data-we-sidebar-fullclear")')
+      && unpairOk(SRC));
+  }
+
+  // ── F8：原生 select 弹层的选项行必须显式不透明底 + 玻璃墨色（用户报告：下拉底色与字同色）──
+  // Chromium 的弹层是独立文档：画布只在 select 自身背景不透明时才取它的底色，而我们的
+  // select 是透明玻璃底 ⇒ 弹层落到默认浅色画布；选项文字继承玻璃墨色（深色主题=浅字）
+  // ⇒ 浅字浅底整列不可读。修法 = option 行显式 --we-panel-color + --we-ink（Chromium
+  // 弹层按 option 的已解析计算样式逐行画）。判据钉住：这条 option 规则必须存在、必须
+  // 同时声明两个 var、且底色必须是 --we-panel-color（不透明面板底）——防止将来有人把
+  // 底色改回透明/半透明玻璃形态而弹层再次不可读。
+  {
+    // header 可能带着规则前的整段注释（rulesWithProp 取的是"上一个 } 到 { 之间"的原文）
+    // ⇒ 先剥注释再匹配选择器，避免"注释里出现同名选择器"与"注释吃掉行首锚"两种假判。
+    const optRules = rulesWithProp('background-color')
+      .map((r) => ({ header: r.header.replace(/\/\*[^]*?\*\//g, ' ').trim(), body: r.body }))
+      .filter((r) => /(^|,)\s*(\.we-picker select|\.we-picker__select) option/.test(r.header));
+    const ok = (r) => r.body.includes('background-color: var(--we-panel-color') && r.body.includes('color: var(--we-ink');
+    check('F8 原生下拉弹层选项行：option 规则在位且为不透明面板底 + 玻璃墨色（双作用域：.we-picker select 与 .we-picker__select）',
+      optRules.length >= 1 && optRules.every(ok),
+      optRules.length + ' 条 option 规则' + (optRules.length ? ' · 作用域 ' + optRules.map((r) => r.header.replace(/\s+/g, ' ').trim().slice(0, 60)).join(' | ') : ''));
+    // 负对照 ①：底色改回透明玻璃形态（color-mix 半透明）会被同一条判据判出；
+    // 负对照 ②：丢掉墨色声明也会被判出。
+    const bad = optRules[0] ? {
+      header: optRules[0].header,
+      body: optRules[0].body.replace(/background-color:\s*var\(--we-panel-color[^;]*;/, 'background-color: color-mix(in srgb, var(--we-sidebar-color) 20%, transparent);'),
+    } : null;
+    const badNoInk = optRules[0] ? {
+      header: optRules[0].header,
+      body: optRules[0].body.replace(/\s*color:\s*var\(--we-ink[^;]*;/, ''),
+    } : null;
+    check('negative control F8-1: option 底色改回半透明玻璃（弹层再次浅底浅字）会被判出',
+      bad ? !ok(bad) : false);
+    check('negative control F8-2: option 丢墨色声明会被判出',
+      badNoInk ? !ok(badNoInk) : false);
+  }
+
+  const failed = results.filter((r) => !r.ok);
+  console.log('\n' + (failed.length === 0
+    ? 'ALL READABILITY FLOOR CHECKS PASSED'
+    : failed.length + ' CHECK(S) FAILED'));
+  process.exit(failed.length === 0 ? 0 : 1);
+}
+
+try {
+  main();
+} catch (err) {
+  console.error('TEST ERROR:', err && err.stack ? err.stack : err);
+  process.exit(1);
+}
