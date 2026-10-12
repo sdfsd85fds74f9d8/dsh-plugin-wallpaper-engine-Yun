@@ -1,0 +1,23 @@
+# dsh-plugin-wallpaper-engine bundle patch.
+#
+# Applied over the dsh-web-app layer. This bundle contributes ONE host row
+# (the plugin that scans Wallpaper Engine and serves its media) and relies on
+# its `dsh.client` manifest (in package.json) to load the browser half that
+# draws the wallpaper behind the DSH GUI and adds the settings UI.
+#
+# A patch replaces the targeted row's whole `config`, so only additive
+# `insert` rows appear here (we never override an existing shipped row).
+
+- insert:
+    # Host half: discovers the local Wallpaper Engine install (Steam app 431960),
+    # enumerates Scene/Video/Web wallpapers from the Workshop + default projects
+    # (Application wallpapers are listed but never rendered),
+    # and serves their media + a JSON inventory over same-origin HTTP routes
+    # the browser half fetches directly (GET /wallpaper-engine/inventory, /media,
+    # /preview, …; docs/ROUTE-INDEX.md is the authoritative table — it is generated
+    # and machine-checked, so the route count is deliberately not repeated here).
+    - id: dsh-plugin-wallpaper-engine-Yun
+      name: 'dsh-plugin-wallpaper-engine-Yun'
+      # webServer is a hard dependency (`inject = ['webServer']` in lib/index.js):
+      # the Loader waits for the HTTP server to mount, so a headless/TUI profile
+      # without one does not load this bundle at all.
